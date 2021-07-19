@@ -4,7 +4,7 @@ import copy
 import time
 from dircycle2 import dircyc,almostdircyc
 from heuristic2 import contract_heur,contract_heur_bdir
-from gurobipy import *
+import cplex
 
 class BNSLlvInst:
 	def __init__(self,instance):
@@ -34,9 +34,56 @@ class BNSLlvInst:
 		file = open(filename, 'rb')
 		[self.data,self.originalScores] = pickle.load(file)
 		file.close()
-
-	# Prune redundant c-components
-	def Prune_scores(self):
+		
+	def readFromDag(self):
+		filename = '../Instances/data/'+self.instance
+		file = open(filename, 'r')
+		x = file.readlines()
+		file.close
+		self.originalScores = {}
+		Vsize = int(x[0].strip('\n'))
+		lineind = 1
+		for k in range(Vsize):
+			line = x[lineind]
+			z = line.strip('\n').split(' ')
+			i = int(z[0])
+			nPaSets = int(z[1])
+			self.originalScores[(i,),()] = {}
+			for p in range(nPaSets):
+				line = x[lineind+1+p]
+				z = line.strip('\n').split(' ')
+				PaSize = int(z[1])
+				PaSet = []
+				for t in range(PaSize):
+					PaSet.append(int(z[2+t]))
+				self.originalScores[(i,),()][(tuple(PaSet),)] = float(z[0])
+			lineind = lineind+1+nPaSets
+		if len(x) > lineind:
+			lineind = lineind+1
+			csize = int(x[lineind].strip('\n'))
+			for k in range(csize):
+				lineind = lineind+1
+				line = x[lineind]
+				z = line.strip('\n').split()
+				nNodes = int(z[0])
+				score = float(z[1])
+				cComp = []
+				for k in range(nNodes):
+					cComp.append(int(z[2+k]))
+				cComp = tuple(cComp)
+				# Only consider size-2 c-components now...
+				biEdges = (cComp,)
+				if cComp not in self.originalScores.keys():
+					self.originalScores[cComp,biEdges] = {}
+				parsets = []
+				for p in range(len(cComp)):
+					lineind = lineind+1
+					z = x[lineind].strip('\n').split()
+					parset = [int(z[i]) for i in range(2,len(z))]
+					parsets.append(tuple(parset))
+				self.originalScores[cComp,biEdges][tuple(parsets)] = score
+		
+	def Prune_scores(self,prune_more=False):
 		t0P = time.time()
 		sum1 = 0
 		sum2 = 0
@@ -134,6 +181,9 @@ class BNSLlvInst:
 							if i != Nodeb and i in D[1][1]:
 								Nodec = i
 								break
+						if prune_more == True and (Nodea in Dpars[D][ind][D[0].index(Nodec)] or Nodec in Dpars[D][ind][D[0].index(Nodea)]):
+							Dparscopy.remove(Dpars[D][ind])
+							continue
 						Da = ((Nodea,),())
 						Db = ((Nodeb,),())
 						Dc = ((Nodec,),())
@@ -302,7 +352,7 @@ class BNSLlvInst:
 				sum1 = sum1+len(Dpars[D])
 				sum2 = sum2+len(Dpars[D])
 		print(str(sum1)+" vs "+str(sum2)+", pruning time: "+str(time.time()-t0P))
-		fileName = '../Results/'+self.instance+'.log'
+		fileName = '../Results/'+self.instance+'_cplex.log'
 		f = open(fileName,"a")
 		f.write(str(sum1)+" vs "+str(sum2)+", pruning time: "+str(time.time()-t0P))
 		f.close
@@ -314,9 +364,9 @@ class BNSLlvInst:
 					self.scores[D] = {}
 				self.scores[D][Dpar] = self.originalScores[D][Dpar]
 
-	def Initialize(self,prune=True,dag=False,printsc=False):
+	def Initialize(self,prune=True,dag=False,printsc=False,prune_parentInDistrict=False):
 		if prune == True:
-			self.Prune_scores()
+			self.Prune_scores(prune_more=prune_parentInDistrict)
 		else:
 			self.scores = self.originalScores
 		self.V = set()
@@ -358,20 +408,20 @@ class BNSLlvInst:
 					biPar = (W[D[0].index(bi[0])],W[D[0].index(bi[1])])
 					if biPar not in self.biPars[bi]:
 						self.biPars[bi].append(biPar)
-		
-		self.m = Model()
-		self.m.modelSense = GRB.MAXIMIZE
-		self.m.Params.MIPGAP = 1e-6
+		self.m = cplex.Cplex()
 		self.z = {}
 		for d in range(len(self.cComps)):
 			for dp in range(len(self.dPars[d])):
-				self.z[d,dp] = self.m.addVar(vtype=GRB.BINARY,obj=self.scores[self.cComps[d]][self.dPars[d][dp]],name='z'+str(d)+','+str(dp))
-				if dag == True:
-					if len(self.cComps[d][0]) > 1:
-						self.z[d,dp].ub = 0.0
+				if dag == False or len(self.cComps[d][0]) <= 1:
+					self.z[d,dp] = self.m.variables.add(obj=[self.scores[self.cComps[d]][self.dPars[d][dp]]],lb=[0],ub=[1],types=['B'],names=['z'+str(d)+','+str(dp)])
+				else:
+					self.z[d,dp] = self.m.variables.add(obj=[self.scores[self.cComps[d]][self.dPars[d][dp]]],lb=[0],ub=[0],types=['B'],names=['z'+str(d)+','+str(dp)])
+		
+		self.m.objective.set_sense(self.m.objective.sense.maximize)
+		
 		
 		for i in self.V:
-			self.m.addConstr(quicksum(self.z[d,dp] for d in self.iComps[i] for dp in range(len(self.dPars[d]))) == 1)
+			self.m.linear_constraints.add(lin_expr=[cplex.SparsePair(ind = ['z'+str(d)+','+str(dp) for d in self.iComps[i] for dp in range(len(self.dPars[d]))], val = [1]*sum(len(self.dPars[d]) for d in self.iComps[i]))], senses=["E"], rhs=[1])
 
 		self.indInv = []
 		for i in self.V:
@@ -382,17 +432,17 @@ class BNSLlvInst:
 
 		self.bi = {}
 		for e in self.udE:
-			self.bi[e] = self.m.addVar(name='bi'+str(e))
-			self.m.addConstr(self.bi[e] == quicksum(self.z[d,dp] for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if self.indInv[e] in self.cComps[d][1]))
+			self.bi[e] = self.m.variables.add(obj=[0],types=['C'],names=['bi'+str(e)])
+			zindex_set = ['z'+str(d)+','+str(dp) for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if self.indInv[e] in self.cComps[d][1]]
+			self.m.linear_constraints.add(lin_expr=[cplex.SparsePair(ind = zindex_set+['bi'+str(e)], val = [1]*len(zindex_set)+[-1])], senses=["E"], rhs=[0])
 			
 		self.x = {}
 		for i in self.V:
 			for ip in range(len(self.iPars[i])):
-				self.x[i,ip] = self.m.addVar(name='x'+str(i)+','+str(ip))
-				self.m.addConstr(self.x[i,ip] == quicksum(self.z[d,dp] for d in self.iComps[i] for dp in range(len(self.dPars[d])) if self.dPars[d][dp][self.cComps[d][0].index(i)] == self.iPars[i][ip]))
+				self.x[i,ip] = self.m.variables.add(obj=[0],types=['C'],names=['x'+str(i)+','+str(ip)])
+				zindex_set = ['z'+str(d)+','+str(dp) for d in self.iComps[i] for dp in range(len(self.dPars[d])) if self.dPars[d][dp][self.cComps[d][0].index(i)] == self.iPars[i][ip]]
+				self.m.linear_constraints.add(lin_expr=[cplex.SparsePair(ind = zindex_set+['x'+str(i)+','+str(ip)], val = [1]*len(zindex_set)+[-1])], senses=["E"], rhs=[0])
 
-		self.m.update()
-		
 	def biClusterToIneq(self,C,ii,jj):
 		if jj < ii:
 			cp = jj
@@ -435,30 +485,28 @@ class BNSLlvInst:
 		nbi = len(self.udE)
 		ncluster = 0
 		nbicluster = 0
+		out = self.m.set_results_stream(None)
+		out = self.m.set_log_stream(None)
 
 		while ContinueCondt == True and LPiter < 100:
 			nz_bi = 0
 			nz_z = 0
 			ContinueCondt = False
 			LPiter = LPiter+1
-			self.m.update()
-			LPrelax = self.m.relax()
-			LPrelax.setParam('OutputFlag', False)
-			LPrelax.update()
-			LPrelax.optimize()
+			self.m.parameters.mip.limits.nodes = 0
+			model_soln = self.m.solve()
 			PrevObjvalue = Objvalue
-			Objvalue = LPrelax.ObjVal
-			
+			Objvalue = self.m.solution.get_objective_value()
 			
 			for d in range(len(self.cComps)):
 				for dp in range(len(self.dPars[d])):
-					if LPrelax.getVarByName('z'+str(d)+','+str(dp)).x > 0:
+					if self.m.solution.get_values(['z'+str(d)+','+str(dp)])[0] > 0:
 						nz_z = nz_z+1
 			for e in self.udE:
-				if LPrelax.getVarByName('bi'+str(e)).x > 0:
+				if self.m.solution.get_values(['bi'+str(e)])[0] > 0:
 					nz_bi = nz_bi+1
 			
-			print('LP iter '+str(LPiter)+', ObjVal: '+str(LPrelax.ObjVal)+', time: '+str(time.time()-t0)+', frac. of nonzero variables: '+\
+			print('LP iter '+str(LPiter)+', ObjVal: '+str(Objvalue)+', time: '+str(time.time()-t0)+', frac. of nonzero variables: '+\
 				str(nz_z)+'/'+str(nvar)+', frac. of nonzero bidirected edges: '+str(nz_bi)+'/'+str(nbi)+', # cluster: '+str(ncluster)+', # bi-cluster: '+str(nbicluster))
 		
 			ncluster = 0
@@ -467,14 +515,14 @@ class BNSLlvInst:
 			x_value = {}
 			z_value = {}
 			for e in self.udE:
-				bi_value[e] =  LPrelax.getVarByName('bi'+str(e)).x
+				bi_value[e] = self.m.solution.get_values(['bi'+str(e)])[0]
 			for i in self.V:
 				for ip in range(len(self.iPars[i])):
-					x_value[i,ip] = LPrelax.getVarByName('x'+str(i)+','+str(ip)).x
+					x_value[i,ip] = self.m.solution.get_values(['x'+str(i)+','+str(ip)])[0]
 			for d in range(len(self.cComps)):
 				for dp in range(len(self.dPars[d])):
-					z_value[d,dp] = LPrelax.getVarByName('z'+str(d)+','+str(dp)).x
-			
+					z_value[d,dp] = self.m.solution.get_values(['z'+str(d)+','+str(dp)])[0]
+
 			wt = {}
 			for i in self.V:
 				for ip in range(len(self.iPars[i])):
@@ -494,13 +542,13 @@ class BNSLlvInst:
 			allcyc = dircyc(len(self.V),int(len(telist)/2),telist)
 			for Cluster in allcyc:
 				ifLHS = self.ClusterToIneq(Cluster)
-				self.m.addConstr(quicksum(self.z[d,dp] for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True) >= 1 )
+				zindex_set = ['z'+str(d)+','+str(dp) for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True]
+				self.m.linear_constraints.add(lin_expr=[cplex.SparsePair(ind = zindex_set, val = [1]*len(zindex_set))], senses=["G"], rhs=[1])
 				
 			if len(allcyc) > 0:
 				ncluster = len(allcyc)
 				ContinueCondt = True
 			else:
-				# Contracting heursitics for separating cluster ineqs and bi-cluster ineqs
 				nnode = len(self.V)
 				gcnodes = []
 				gcweight = []
@@ -518,7 +566,8 @@ class BNSLlvInst:
 				dircycs = contract_heur(nnode+1, gcnodes, gcparents, gcweight,1.0)
 				for Cluster in dircycs:
 					ifLHS = self.ClusterToIneq(Cluster)
-					self.m.addConstr(quicksum(self.z[d,dp] for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True) >= 1 )
+					zindex_set = ['z'+str(d)+','+str(dp) for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True]
+					self.m.linear_constraints.add(lin_expr=[cplex.SparsePair(ind = zindex_set, val = [1]*len(zindex_set))], senses=["G"], rhs=[1])
 				ncluster = ncluster+len(dircycs)
 
 				aldircycs = contract_heur_bdir(nnode+1, gcnodes, gcparents, gcweight)
@@ -528,25 +577,29 @@ class BNSLlvInst:
 					e = self.indInv.index((ii,jj))
 					C = set(Cluster[2:])
 					ifLHS = self.biClusterToIneq(C,ii,jj)
-					self.m.addConstr(quicksum(self.z[d,dp] for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True) >= self.bi[e])
+					zindex_set = ['z'+str(d)+','+str(dp) for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True]
+					self.m.linear_constraints.add(lin_expr=[cplex.SparsePair(ind = zindex_set+['bi'+str(e)], val = [1]*len(zindex_set)+[-1])], senses=["G"], rhs=[0])
 				nbicluster = nbicluster+len(aldircycs)
 
-				if ncluster+nbicluster >0 and Objvalue > PrevObjvalue:
+				if ncluster+nbicluster > 0 and Objvalue > PrevObjvalue:
 					ContinueCondt = True
-				
+		self.m.parameters.mip.limits.nodes = 9223372036800000000
 		tRoot = time.time()-t0
-		
-		def cb(model,where):
-			if where == GRB.Callback.MIPSOL:
+
+		class LazyCallback(cplex.callbacks.LazyConstraintCallback):
+			def __init__(self, env):
+				super().__init__(env)
+
+			def __call__(self):
 				NoCluster = False
 				bi_value = {}
 				x_value = {}
 				for e in self.udE:
-					bi_value[e] =  model.cbGetSolution(self.bi[e])
+					bi_value[e] =  self.get_values(['bi'+str(e)])[0]
 				for i in self.V:
 					for ip in range(len(self.iPars[i])):
-						x_value[i,ip] = model.cbGetSolution(self.x[i,ip])
-						
+						x_value[i,ip] = self.get_values(['x'+str(i)+','+str(ip)])[0]
+				
 				ActiveEdgeList = []
 				
 				for i in self.V:
@@ -561,8 +614,8 @@ class BNSLlvInst:
 				cycList = dircyc(len(self.V),ne,ActiveEdgeList)
 				for Cluster in cycList:
 					ifLHS = self.ClusterToIneq(Cluster)
-					model.cbLazy(quicksum(self.z[d,dp] for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True) >= 1 )
-					
+					zindex_set = ['z'+str(d)+','+str(dp) for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True]
+					self.add(constraint=cplex.SparsePair(ind = zindex_set, val = [1]*len(zindex_set)), sense="G", rhs=1)
 				# Detecting almost directed cycles and adding bi-cluster inequalities
 				for e in self.udE:
 					if bi_value[e] > 0.5:
@@ -572,36 +625,47 @@ class BNSLlvInst:
 						for Cluster in adcycList:
 							C = set(Cluster[1:-1])
 							ifLHS = self.biClusterToIneq(C,ii,jj)
-							model.cbLazy(quicksum(self.z[d,dp] for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True) >= self.bi[e])
-							
+							zindex_set = ['z'+str(d)+','+str(dp) for d in range(len(self.cComps)) for dp in range(len(self.dPars[d])) if ifLHS[d,dp]==True]
+							self.add(constraint=cplex.SparsePair(ind = zindex_set+['bi'+str(e)], val = [1]*len(zindex_set)+[-1]), sense="G", rhs=0)
+		self.m.parameters.preprocessing.presolve.set(0)
+		self.m.parameters.mip.strategy.search.set(1)
+		lazyModel = self.m.register_callback(LazyCallback)
+		lazyModel.udE = self.udE
+		lazyModel.bi = self.bi
+		lazyModel.iPars = self.iPars
+		lazyModel.x = self.x
+		lazyModel.z = self.z
+		lazyModel.V = self.V
+		lazyModel.dPars = self.dPars
+		lazyModel.cComps = self.cComps
+		lazyModel.indInv = self.indInv
+		lazyModel.ClusterToIneq = self.ClusterToIneq
+		lazyModel.biClusterToIneq = self.biClusterToIneq
+		self.m.solve()
 
-
-		self.m.Params.Heuristics = 0.0
-		self.m.Params.lazyConstraints = 1
-		self.m.Params.LogFile = '../Results/'+self.instance+'.log'
-		self.m.update()
-		self.m.optimize(cb)
-		fileName = '../Results/'+self.instance+'.log'
+		fileName = '../Results/'+self.instance+'_cplex.log'
 		wrtStr = 'Time at root: '+str(tRoot)+'\n'
 		wrtStr = 'Total solution time: '+str(time.time()-t0)+'\n'
+		wrtStr = 'Score: '+str(self.m.solution.get_objective_value())+'\n'
+		print('Score: '+str(self.m.solution.get_objective_value()))
 		print('Bidirected edges: ')
 		wrtStr = wrtStr+'Bidirected edges: \n'
 		for e in self.udE:
-			if self.bi[e].x > 0.5:
+			if self.m.solution.get_values(['bi'+str(e)])[0] > 0.5:
 				print(self.indInv[e])
 				wrtStr = wrtStr+str(self.indInv[e])+'\n'
 		print('Parent sets: ')
 		wrtStr = wrtStr+'Parent sets: \n'
 		for i in self.V:
 			for ip in range(len(self.iPars[i])):
-				if self.x[i,ip].x > 0.5:
+				if self.m.solution.get_values(['x'+str(i)+','+str(ip)])[0] > 0.5:
 					print(str(i)+': '+str(self.iPars[i][ip]))
 					wrtStr = wrtStr+str(i)+': '+str(self.iPars[i][ip])+'\n'
 		print('z solution: ')
 		wrtStr = wrtStr+'z solution: '
 		for d in range(len(self.cComps)):
 			for dp in range(len(self.dPars[d])):
-				if self.z[d,dp].x > 0.5:
+				if self.m.solution.get_values(['z'+str(d)+','+str(dp)])[0] > 0.5:
 					print(str(self.cComps[d])+': '+str(self.dPars[d][dp])+', score: '+str(self.scores[self.cComps[d]][self.dPars[d][dp]]))
 					wrtStr = wrtStr+str(self.cComps[d])+': '+str(self.dPars[d][dp])+', score: '+str(self.scores[self.cComps[d]][self.dPars[d][dp]])+'\n'
 		f = open(fileName,"a")
@@ -622,4 +686,3 @@ if __name__ == '__main__':
 		inst.readFromPkl()
 		inst.Initialize(prune=True,printsc=False)
 		inst.Solve_with_cb()
-	
